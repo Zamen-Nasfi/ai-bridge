@@ -288,6 +288,9 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/claude") {
+      const accessError = requireBridgeAccess(request, env);
+      if (accessError) return accessError;
+
       let body;
       try {
         body = await request.json();
