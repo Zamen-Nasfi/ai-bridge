@@ -1,6 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
+import {
+  getCloudflareStatus,
+  listCloudflareWorkers
+} from "./cloudflare.js";
 
-const BRIDGE_VERSION = "0.2.0";
+const BRIDGE_VERSION = "0.3.0";
 const BRIDGE_OBJECT_NAME = "main";
 
 function corsHeaders() {
@@ -251,8 +255,19 @@ export default {
         status: "ONLINE",
         bridge: "READY",
         durable_object: "CONFIGURED",
-        message: "AI Bridge v0.2 is operational."
+        cloudflare_gateway: "READ_ONLY",
+        message: "AI Bridge v0.3 is operational."
       });
+    }
+
+    if (request.method === "GET" && url.pathname === "/cloudflare/status") {
+      const result = await getCloudflareStatus(env);
+      return json(result, result.success ? 200 : result.status || 502);
+    }
+
+    if (request.method === "GET" && url.pathname === "/cloudflare/workers") {
+      const result = await listCloudflareWorkers(env, url);
+      return json(result, result.success ? 200 : result.status || 502);
     }
 
     if (request.method === "POST" && url.pathname === "/send") {
@@ -279,14 +294,17 @@ export default {
       status: "ONLINE",
       endpoints: {
         health: "GET /health",
+        cloudflare_status: "GET /cloudflare/status",
+        cloudflare_workers: "GET /cloudflare/workers",
         send: "POST /send",
         messages: "GET /messages",
         acknowledge: "POST /ack"
       },
-      architecture: "HTTP Worker -> SQLite Durable Object -> Message Bus",
-      purpose: "Model-to-model communication transport",
+      architecture: "HTTP Worker -> Cloudflare Read-Only Gateway + SQLite Durable Object",
+      purpose: "Controlled model-to-model transport and Cloudflare read-only access",
       council: "NOT CONNECTED",
-      providers: "NOT CONNECTED"
+      providers: "NOT CONNECTED",
+      write_operations: "DISABLED"
     });
   }
 };
