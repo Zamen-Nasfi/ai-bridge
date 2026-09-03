@@ -29,30 +29,41 @@ The Cloudflare gateway is intentionally **read-only** in v0.3. No Cloudflare wri
 - `GET /cloudflare/status` — verify the configured Cloudflare API token.
 - `GET /cloudflare/workers` — list Workers in the configured Cloudflare account.
 
+The two Cloudflare gateway endpoints require `Authorization: Bearer <BRIDGE_ACCESS_TOKEN>`.
+
 ## Cloudflare API configuration
 
-Create a **read-only** Cloudflare API Token. Do not put the token in source code.
+Create a **read-only** Cloudflare API Token. Cloudflare supports scoped API tokens and recommends API tokens over the legacy global API key. For this phase, grant only the read permission needed to list Workers (Workers Scripts Read) and restrict the token to the required account/resource scope. citeturn1search0turn1search2
 
-Set the token and account ID as Worker secrets:
+Do not put the Cloudflare token in source code or plaintext Worker variables. Cloudflare documents Worker Secrets as the appropriate mechanism for API keys and auth tokens. citeturn1search1
+
+Set these Worker secrets:
 
 ```bash
 wrangler secret put CLOUDFLARE_API_TOKEN
 wrangler secret put CLOUDFLARE_ACCOUNT_ID
+wrangler secret put BRIDGE_ACCESS_TOKEN
 ```
 
-The gateway uses the token as a Bearer token and only performs HTTP `GET` requests in v0.3.
+`BRIDGE_ACCESS_TOKEN` protects the public read-only gateway. It is separate from the Cloudflare API token.
 
 ## Test sequence
 
-After deployment:
+1. `GET /health` — should report the bridge online and the gateway read-only.
+2. `GET /cloudflare/status` with the Bridge bearer token — verifies that the Cloudflare API token is active.
+3. `GET /cloudflare/workers` with the Bridge bearer token — proves account-scoped Workers read access.
 
-```text
-GET /health
-GET /cloudflare/status
-GET /cloudflare/workers
+Example:
+
+```bash
+curl https://YOUR-WORKER.example.workers.dev/cloudflare/status \
+  -H "Authorization: Bearer $BRIDGE_ACCESS_TOKEN"
+
+curl https://YOUR-WORKER.example.workers.dev/cloudflare/workers \
+  -H "Authorization: Bearer $BRIDGE_ACCESS_TOKEN"
 ```
 
-Expected `/cloudflare/status` shape:
+Expected status shape:
 
 ```json
 {
@@ -64,18 +75,20 @@ Expected `/cloudflare/status` shape:
 }
 ```
 
-A failed authentication test should not expose the token or Cloudflare response body.
+An unauthenticated request to either Cloudflare gateway endpoint should return `401`. Missing configuration returns `503`. Cloudflare API failures do not expose the Cloudflare response body or token.
 
 ## Security boundary
 
 - Cloudflare credentials remain Worker Secrets.
-- The public gateway does not accept a Cloudflare token from the request.
-- v0.3 exposes only read operations.
-- Cloudflare write operations are deliberately disabled until the read-only path is verified.
+- The public gateway does not accept a Cloudflare API token from the request.
+- Cloudflare gateway endpoints require a separate Bridge access token.
+- v0.3 exposes only Cloudflare `GET` operations.
+- No Cloudflare write operation is implemented.
+- Cloudflare write permissions should not be granted until the read-only path has been verified.
 
 ## Durable Object
 
-The message bus continues to use the `AIBridge` SQLite Durable Object binding defined in `wrangler.toml`.
+The message bus continues to use the `AIBridge` SQLite Durable Object binding defined in `wrangler.toml`. The existing binding is preserved; this release does not introduce a second Durable Object. 
 
 ## Deploy
 
