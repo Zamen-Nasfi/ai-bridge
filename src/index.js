@@ -62,6 +62,47 @@ function requireBridgeAccess(request, env) {
   return null;
 }
 
+async function callClaude(env, messages) {
+  if (!env.OPENROUTER_API_KEY) {
+    return {
+      success: false,
+      error: "OPENROUTER_API_KEY_NOT_CONFIGURED"
+    };
+  }
+
+  const response = await fetch(
+    "https://openrouter.ai/api/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "anthropic/claude-sonnet-4",
+        messages
+      })
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    return {
+      success: false,
+      error: "OPENROUTER_ERROR",
+      status: response.status,
+      details: data
+    };
+  }
+
+  return {
+    success: true,
+    model: data.model,
+    reply: data.choices?.[0]?.message?.content ?? ""
+  };
+}
+
 export class AIBridge extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -246,6 +287,29 @@ export default {
       return json(result, result.success ? 200 : result.status || 502);
     }
 
+    if (request.method === "POST" && url.pathname === "/claude") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ success: false, error: "INVALID_JSON" }, 400);
+      }
+
+      if (!Array.isArray(body.messages)) {
+        return json({
+          success: false,
+          error: "INVALID_MESSAGES"
+        }, 400);
+      }
+
+      const result = await callClaude(env, body.messages);
+
+      return json(
+        result,
+        result.success ? 200 : (result.status || 502)
+      );
+    }
+
     if (request.method === "POST" && url.pathname === "/send") {
       const id = env.BRIDGE.idFromName(BRIDGE_OBJECT_NAME);
       const stub = env.BRIDGE.get(id);
@@ -272,6 +336,7 @@ export default {
         health: "GET /health",
         cloudflare_status: "GET /cloudflare/status",
         cloudflare_workers: "GET /cloudflare/workers",
+        claude: "POST /claude",
         send: "POST /send",
         messages: "GET /messages",
         acknowledge: "POST /ack"
