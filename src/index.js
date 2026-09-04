@@ -24,137 +24,89 @@ function json(data, status = 200) {
 }
 
 function validateMessage(body) {
-  if (!body || typeof body !== "object") {
-    return { valid: false, reason: "BODY_MUST_BE_OBJECT" };
-  }
-  if (typeof body.from !== "string" || body.from.length === 0 || body.from.length > 50) {
-    return { valid: false, reason: "INVALID_FROM" };
-  }
-  if (typeof body.to !== "string" || body.to.length === 0 || body.to.length > 50) {
-    return { valid: false, reason: "INVALID_TO" };
-  }
-  if (typeof body.type !== "string" || body.type.length === 0 || body.type.length > 100) {
-    return { valid: false, reason: "INVALID_TYPE" };
-  }
-  if (typeof body.payload !== "string" || body.payload.length === 0 || body.payload.length > 10000) {
-    return { valid: false, reason: "INVALID_PAYLOAD" };
-  }
+  if (!body || typeof body !== "object") return { valid: false, reason: "BODY_MUST_BE_OBJECT" };
+  if (typeof body.from !== "string" || body.from.length === 0 || body.from.length > 50) return { valid: false, reason: "INVALID_FROM" };
+  if (typeof body.to !== "string" || body.to.length === 0 || body.to.length > 50) return { valid: false, reason: "INVALID_TO" };
+  if (typeof body.type !== "string" || body.type.length === 0 || body.type.length > 100) return { valid: false, reason: "INVALID_TYPE" };
+  if (typeof body.payload !== "string" || body.payload.length === 0 || body.payload.length > 10000) return { valid: false, reason: "INVALID_PAYLOAD" };
   return { valid: true, reason: null };
 }
 
 function requireBridgeAccess(request, env) {
   if (!env.BRIDGE_ACCESS_TOKEN) {
-    return json({
-      success: false,
-      error: "BRIDGE_ACCESS_TOKEN_NOT_CONFIGURED",
-      message: "Set the BRIDGE_ACCESS_TOKEN Worker secret before using protected gateway endpoints."
-    }, 503);
+    return json({ success: false, error: "BRIDGE_ACCESS_TOKEN_NOT_CONFIGURED", message: "Set the BRIDGE_ACCESS_TOKEN Worker secret before using protected gateway endpoints." }, 503);
   }
-
   const authorization = request.headers.get("Authorization") || "";
-  if (authorization !== `Bearer ${env.BRIDGE_ACCESS_TOKEN}`) {
-    return json({
-      success: false,
-      error: "UNAUTHORIZED"
-    }, 401);
-  }
-
+  if (authorization !== `Bearer ${env.BRIDGE_ACCESS_TOKEN}`) return json({ success: false, error: "UNAUTHORIZED" }, 401);
   return null;
 }
 
 async function callClaude(env, messages) {
-  if (!env.OPENROUTER_API_KEY) {
-    return {
-      success: false,
-      error: "OPENROUTER_API_KEY_NOT_CONFIGURED"
-    };
-  }
+  if (!env.OPENROUTER_API_KEY) return { success: false, error: "OPENROUTER_API_KEY_NOT_CONFIGURED" };
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/claude-sonnet-4", messages })
+  });
+  const data = await response.json();
+  if (!response.ok) return { success: false, error: "OPENROUTER_ERROR", status: response.status, details: data };
+  return { success: true, model: data.model, reply: data.choices?.[0]?.message?.content ?? "" };
+}
 
-  const response = await fetch(
-    "https://openrouter.ai/api/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "anthropic/claude-sonnet-4",
-        messages
-      })
-    }
-  );
+async function callAnthropic(env, body) {
+  if (!env.ANTHROPIC_API_KEY) return { success: false, error: "ANTHROPIC_API_KEY_NOT_CONFIGURED" };
+
+  const messages = Array.isArray(body.messages)
+    ? body.messages
+    : [{ role: "user", content: body.message }];
+
+  if (!Array.isArray(messages) || messages.length === 0) return { success: false, error: "INVALID_MESSAGES" };
+
+  const requestBody = {
+    model: body.model || "claude-sonnet-4-20250514",
+    max_tokens: Number(body.max_tokens || 1000),
+    messages
+  };
+  if (body.system) requestBody.system = body.system;
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(requestBody)
+  });
 
   const data = await response.json();
-
-  if (!response.ok) {
-    return {
-      success: false,
-      error: "OPENROUTER_ERROR",
-      status: response.status,
-      details: data
-    };
-  }
-
-  return {
-    success: true,
-    model: data.model,
-    reply: data.choices?.[0]?.message?.content ?? ""
-  };
+  if (!response.ok) return { success: false, error: "ANTHROPIC_ERROR", status: response.status, details: data };
+  return { success: true, model: data.model, reply: data.content?.map(item => item.text || "").join("") || "" };
 }
 
 export class AIBridge extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        sender TEXT NOT NULL,
-        recipient TEXT NOT NULL,
-        type TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        status TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        acknowledged_at INTEGER,
-        acknowledged_by TEXT
+        id TEXT PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+        type TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL,
+        created_at INTEGER NOT NULL, acknowledged_at INTEGER, acknowledged_by TEXT
       )
     `);
-
-    this.ctx.storage.sql.exec(`
-      CREATE INDEX IF NOT EXISTS idx_messages_recipient_status
-      ON messages(recipient, status, created_at)
-    `);
+    this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS idx_messages_recipient_status ON messages(recipient, status, created_at)`);
   }
 
   async sendMessage(body) {
     const validation = validateMessage(body);
     if (!validation.valid) return { success: false, error: validation.reason };
-
     const id = crypto.randomUUID();
     const createdAt = Date.now();
-
     this.ctx.storage.sql.exec(
-      `INSERT INTO messages (
-        id, sender, recipient, type, payload, status,
-        created_at, acknowledged_at, acknowledged_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, body.from, body.to, body.type, body.payload,
-      "PENDING", createdAt, null, null
+      `INSERT INTO messages (id, sender, recipient, type, payload, status, created_at, acknowledged_at, acknowledged_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, body.from, body.to, body.type, body.payload, "PENDING", createdAt, null, null
     );
-
-    return {
-      success: true,
-      message: {
-        id,
-        from: body.from,
-        to: body.to,
-        type: body.type,
-        payload: body.payload,
-        status: "PENDING",
-        created_at: createdAt
-      }
-    };
+    return { success: true, message: { id, from: body.from, to: body.to, type: body.type, payload: body.payload, status: "PENDING", created_at: createdAt } };
   }
 
   async getMessages(url) {
@@ -162,193 +114,84 @@ export class AIBridge extends DurableObject {
     const status = url.searchParams.get("status") || "PENDING";
     const limitRaw = Number(url.searchParams.get("limit") || "50");
     const limit = Math.min(Math.max(limitRaw, 1), 100);
-
-    let rows;
-    if (recipient) {
-      rows = this.ctx.storage.sql.exec(
-        `SELECT id, sender, recipient, type, payload, status,
-                created_at, acknowledged_at, acknowledged_by
-         FROM messages
-         WHERE recipient = ? AND status = ?
-         ORDER BY created_at ASC LIMIT ?`,
-        recipient, status, limit
-      ).toArray();
-    } else {
-      rows = this.ctx.storage.sql.exec(
-        `SELECT id, sender, recipient, type, payload, status,
-                created_at, acknowledged_at, acknowledged_by
-         FROM messages
-         WHERE status = ?
-         ORDER BY created_at ASC LIMIT ?`,
-        status, limit
-      ).toArray();
-    }
-
+    const rows = recipient
+      ? this.ctx.storage.sql.exec(`SELECT id, sender, recipient, type, payload, status, created_at, acknowledged_at, acknowledged_by FROM messages WHERE recipient = ? AND status = ? ORDER BY created_at ASC LIMIT ?`, recipient, status, limit).toArray()
+      : this.ctx.storage.sql.exec(`SELECT id, sender, recipient, type, payload, status, created_at, acknowledged_at, acknowledged_by FROM messages WHERE status = ? ORDER BY created_at ASC LIMIT ?`, status, limit).toArray();
     return { success: true, count: rows.length, messages: rows };
   }
 
   async acknowledge(body) {
     if (!body || typeof body !== "object") return { success: false, error: "BODY_MUST_BE_OBJECT" };
-    if (typeof body.message_id !== "string" || body.message_id.length === 0) {
-      return { success: false, error: "INVALID_MESSAGE_ID" };
-    }
-    if (typeof body.by !== "string" || body.by.length === 0) {
-      return { success: false, error: "INVALID_ACKNOWLEDGER" };
-    }
-
+    if (typeof body.message_id !== "string" || body.message_id.length === 0) return { success: false, error: "INVALID_MESSAGE_ID" };
+    if (typeof body.by !== "string" || body.by.length === 0) return { success: false, error: "INVALID_ACKNOWLEDGER" };
     const acknowledgedAt = Date.now();
-    const result = this.ctx.storage.sql.exec(
-      `UPDATE messages
-       SET status = ?, acknowledged_at = ?, acknowledged_by = ?
-       WHERE id = ? AND status = ?`,
-      "ACKNOWLEDGED", acknowledgedAt, body.by, body.message_id, "PENDING"
-    );
-
-    if (result.rowsWritten === 0) {
-      return { success: false, error: "MESSAGE_NOT_FOUND_OR_ALREADY_ACKNOWLEDGED" };
-    }
-
-    return {
-      success: true,
-      message_id: body.message_id,
-      status: "ACKNOWLEDGED",
-      acknowledged_by: body.by,
-      acknowledged_at: acknowledgedAt
-    };
+    const result = this.ctx.storage.sql.exec(`UPDATE messages SET status = ?, acknowledged_at = ?, acknowledged_by = ? WHERE id = ? AND status = ?`, "ACKNOWLEDGED", acknowledgedAt, body.by, body.message_id, "PENDING");
+    if (result.rowsWritten === 0) return { success: false, error: "MESSAGE_NOT_FOUND_OR_ALREADY_ACKNOWLEDGED" };
+    return { success: true, message_id: body.message_id, status: "ACKNOWLEDGED", acknowledged_by: body.by, acknowledged_at: acknowledgedAt };
   }
 
   async fetch(request) {
     const url = new URL(request.url);
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
-    }
-
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
     if (request.method === "POST" && url.pathname === "/send") {
-      let body;
-      try { body = await request.json(); }
-      catch { return json({ success: false, error: "INVALID_JSON" }, 400); }
-      const result = await this.sendMessage(body);
-      return json(result, result.success ? 200 : 400);
+      let body; try { body = await request.json(); } catch { return json({ success: false, error: "INVALID_JSON" }, 400); }
+      const result = await this.sendMessage(body); return json(result, result.success ? 200 : 400);
     }
-
-    if (request.method === "GET" && url.pathname === "/messages") {
-      return json(await this.getMessages(url));
-    }
-
+    if (request.method === "GET" && url.pathname === "/messages") return json(await this.getMessages(url));
     if (request.method === "POST" && url.pathname === "/ack") {
-      let body;
-      try { body = await request.json(); }
-      catch { return json({ success: false, error: "INVALID_JSON" }, 400); }
-      const result = await this.acknowledge(body);
-      return json(result, result.success ? 200 : 400);
+      let body; try { body = await request.json(); } catch { return json({ success: false, error: "INVALID_JSON" }, 400); }
+      const result = await this.acknowledge(body); return json(result, result.success ? 200 : 400);
     }
-
-    return json({
-      service: "AI Bridge Durable Object",
-      version: BRIDGE_VERSION,
-      status: "ONLINE"
-    });
+    return json({ service: "AI Bridge Durable Object", version: BRIDGE_VERSION, status: "ONLINE" });
   }
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
-    }
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
     if (request.method === "GET" && url.pathname === "/health") {
-      return json({
-        service: "AI Bridge",
-        version: BRIDGE_VERSION,
-        status: "ONLINE",
-        bridge: "READY",
-        durable_object: "CONFIGURED",
-        cloudflare_gateway: "READ_ONLY",
-        message: "AI Bridge v0.3 is operational."
-      });
+      return json({ service: "AI Bridge", version: BRIDGE_VERSION, status: "ONLINE", bridge: "READY", durable_object: "CONFIGURED", cloudflare_gateway: "READ_ONLY", message: "AI Bridge v0.3 is operational." });
     }
 
-    if (
-      request.method === "GET" &&
-      (url.pathname === "/cloudflare/status" || url.pathname === "/cloudflare/workers")
-    ) {
-      const accessError = requireBridgeAccess(request, env);
-      if (accessError) return accessError;
+    if (request.method === "GET" && (url.pathname === "/cloudflare/status" || url.pathname === "/cloudflare/workers")) {
+      const accessError = requireBridgeAccess(request, env); if (accessError) return accessError;
+      if (url.pathname === "/cloudflare/status") { const result = await getCloudflareStatus(env); return json(result, result.success ? 200 : result.status || 502); }
+      const result = await listCloudflareWorkers(env, url); return json(result, result.success ? 200 : result.status || 502);
+    }
 
-      if (url.pathname === "/cloudflare/status") {
-        const result = await getCloudflareStatus(env);
-        return json(result, result.success ? 200 : result.status || 502);
-      }
-
-      const result = await listCloudflareWorkers(env, url);
-      return json(result, result.success ? 200 : result.status || 502);
+    if (request.method === "POST" && url.pathname === "/bridge") {
+      const accessError = requireBridgeAccess(request, env); if (accessError) return accessError;
+      let body; try { body = await request.json(); } catch { return json({ success: false, error: "INVALID_JSON" }, 400); }
+      if (typeof body.message !== "string" || body.message.length === 0) return json({ success: false, error: "INVALID_MESSAGE" }, 400);
+      const result = await callAnthropic(env, body);
+      return json(result, result.success ? 200 : (result.status || 502));
     }
 
     if (request.method === "POST" && url.pathname === "/claude") {
-      const accessError = requireBridgeAccess(request, env);
-      if (accessError) return accessError;
-
-      let body;
-      try {
-        body = await request.json();
-      } catch {
-        return json({ success: false, error: "INVALID_JSON" }, 400);
-      }
-
-      if (!Array.isArray(body.messages)) {
-        return json({
-          success: false,
-          error: "INVALID_MESSAGES"
-        }, 400);
-      }
-
-      const result = await callClaude(env, body.messages);
-
-      return json(
-        result,
-        result.success ? 200 : (result.status || 502)
-      );
+      const accessError = requireBridgeAccess(request, env); if (accessError) return accessError;
+      let body; try { body = await request.json(); } catch { return json({ success: false, error: "INVALID_JSON" }, 400); }
+      if (!Array.isArray(body.messages)) return json({ success: false, error: "INVALID_MESSAGES" }, 400);
+      const result = await callClaude(env, body.messages); return json(result, result.success ? 200 : (result.status || 502));
     }
 
     if (request.method === "POST" && url.pathname === "/send") {
-      const id = env.BRIDGE.idFromName(BRIDGE_OBJECT_NAME);
-      const stub = env.BRIDGE.get(id);
-      return stub.fetch(new Request(new URL("/send", url), request));
+      const id = env.BRIDGE.idFromName(BRIDGE_OBJECT_NAME); const stub = env.BRIDGE.get(id); return stub.fetch(new Request(new URL("/send", url), request));
     }
-
     if (request.method === "GET" && url.pathname === "/messages") {
-      const id = env.BRIDGE.idFromName(BRIDGE_OBJECT_NAME);
-      const stub = env.BRIDGE.get(id);
-      return stub.fetch(new Request(url, request));
+      const id = env.BRIDGE.idFromName(BRIDGE_OBJECT_NAME); const stub = env.BRIDGE.get(id); return stub.fetch(new Request(url, request));
     }
-
     if (request.method === "POST" && url.pathname === "/ack") {
-      const id = env.BRIDGE.idFromName(BRIDGE_OBJECT_NAME);
-      const stub = env.BRIDGE.get(id);
-      return stub.fetch(new Request(new URL("/ack", url), request));
+      const id = env.BRIDGE.idFromName(BRIDGE_OBJECT_NAME); const stub = env.BRIDGE.get(id); return stub.fetch(new Request(new URL("/ack", url), request));
     }
 
     return json({
-      service: "AI Bridge",
-      version: BRIDGE_VERSION,
-      status: "ONLINE",
-      endpoints: {
-        health: "GET /health",
-        cloudflare_status: "GET /cloudflare/status",
-        cloudflare_workers: "GET /cloudflare/workers",
-        claude: "POST /claude",
-        send: "POST /send",
-        messages: "GET /messages",
-        acknowledge: "POST /ack"
-      },
+      service: "AI Bridge", version: BRIDGE_VERSION, status: "ONLINE",
+      endpoints: { health: "GET /health", bridge: "POST /bridge", cloudflare_status: "GET /cloudflare/status", cloudflare_workers: "GET /cloudflare/workers", claude: "POST /claude", send: "POST /send", messages: "GET /messages", acknowledge: "POST /ack" },
       architecture: "HTTP Worker -> Cloudflare Read-Only Gateway + SQLite Durable Object",
       purpose: "Controlled model-to-model transport and Cloudflare read-only access",
-      council: "NOT CONNECTED",
-      providers: "NOT CONNECTED",
-      write_operations: "DISABLED"
+      council: "NOT CONNECTED", providers: "NOT CONNECTED", write_operations: "DISABLED"
     });
   }
 };
